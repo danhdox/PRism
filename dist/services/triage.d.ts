@@ -66,6 +66,9 @@ export declare class TriageService {
     private postIssueCrossReference;
     private applyIssueDedupeLabels;
     private resolveDuplicateStatus;
+    private normalizeSimilarity;
+    private formatSimilarityPercent;
+    private normalizeDuplicateResult;
     private scoreBacklogEntry;
     /**
      * Find similar issues using embeddings

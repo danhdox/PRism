@@ -48014,7 +48014,7 @@ class TriageService {
         const issues = items.filter(item => item.type === 'issue');
         const prs = items.filter(item => item.type === 'pr');
         const formatList = (rows) => rows
-            .map(item => `- [#${item.number}](${item.url}) ${item.title} — score ${item.score} (${item.dedupeStatus}, ${(item.similarity * 100).toFixed(1)}%)`)
+            .map(item => `- [#${item.number}](${item.url}) ${item.title} — score ${item.score} (${item.dedupeStatus}, ${this.formatSimilarityPercent(item.similarity)}%)`)
             .join('\n');
         let body = '## PRism backlog scan\n\n';
         body += 'Prioritized open issues and PRs:\n\n';
@@ -48057,7 +48057,8 @@ class TriageService {
                     similarity: item.similarity,
                 };
             }));
-            const result = await this.llm.detectDuplicate(issue.title, issue.body || '', similarIssuesWithBody);
+            const rawResult = await this.llm.detectDuplicate(issue.title, issue.body || '', similarIssuesWithBody);
+            const result = this.normalizeDuplicateResult(rawResult);
             const classification = this.classifyDedupeResult(result);
             if (classification.status === 'duplicate') {
                 const comment = this.formatDuplicateComment(result, 'issue');
@@ -48107,7 +48108,8 @@ class TriageService {
                     similarity: item.similarity,
                 };
             }));
-            const result = await this.llm.detectDuplicate(pr.title, pr.body || '', similarPrsWithBody);
+            const rawResult = await this.llm.detectDuplicate(pr.title, pr.body || '', similarPrsWithBody);
+            const result = this.normalizeDuplicateResult(rawResult);
             const classification = this.classifyDedupeResult(result);
             if (classification.status === 'duplicate') {
                 const comment = this.formatDuplicateComment(result, 'pr');
@@ -48290,7 +48292,7 @@ class TriageService {
         return severityCounts;
     }
     classifyDedupeResult(result) {
-        const similarity = result.similarItems[0]?.similarity ?? 0;
+        const similarity = this.normalizeSimilarity(result.similarItems[0]?.similarity ?? 0);
         const relatedThreshold = Math.max(0, this.config.duplicateThreshold - 0.1);
         if (result.isDuplicate && similarity >= this.config.duplicateThreshold) {
             return { status: 'duplicate', similarity };
@@ -48351,8 +48353,33 @@ class TriageService {
                 similarity: item.similarity,
             };
         }));
-        const result = await this.llm.detectDuplicate(title, body, similarWithBody);
+        const rawResult = await this.llm.detectDuplicate(title, body, similarWithBody);
+        const result = this.normalizeDuplicateResult(rawResult);
         return this.classifyDedupeResult(result);
+    }
+    normalizeSimilarity(similarity) {
+        if (!Number.isFinite(similarity) || similarity <= 0) {
+            return 0;
+        }
+        if (similarity <= 1) {
+            return similarity;
+        }
+        if (similarity <= 100) {
+            return similarity / 100;
+        }
+        return 1;
+    }
+    formatSimilarityPercent(similarity) {
+        return (this.normalizeSimilarity(similarity) * 100).toFixed(1);
+    }
+    normalizeDuplicateResult(result) {
+        return {
+            ...result,
+            similarItems: result.similarItems.map((item) => ({
+                ...item,
+                similarity: this.normalizeSimilarity(item.similarity),
+            })),
+        };
     }
     scoreBacklogEntry(input) {
         const score = (0, scoring_1.scoreBacklogItem)({
@@ -48433,7 +48460,7 @@ class TriageService {
         let comment = `${emoji} **Potential Duplicate Detected**\n\n`;
         comment += `This ${type} appears to be similar to:\n\n`;
         for (const item of result.similarItems) {
-            const percentage = (item.similarity * 100).toFixed(1);
+            const percentage = this.formatSimilarityPercent(item.similarity);
             comment += `- [#${item.number}](${item.url}) - ${item.title} (${percentage}% similar)\n`;
         }
         comment += `\n**Analysis:**\n${result.reasoning}\n\n`;
@@ -48447,7 +48474,7 @@ class TriageService {
         let comment = `${emoji} **Potentially Related ${typeLabel} Detected**\n\n`;
         comment += `This ${type} appears to be related to:\n\n`;
         for (const item of result.similarItems) {
-            const percentage = (item.similarity * 100).toFixed(1);
+            const percentage = this.formatSimilarityPercent(item.similarity);
             comment += `- [#${item.number}](${item.url}) - ${item.title} (${percentage}% similar)\n`;
         }
         comment += `\n**Analysis:**\n${result.reasoning}\n\n`;
@@ -48457,7 +48484,7 @@ class TriageService {
     }
     formatCrossLinkedIssueComment(sourceIssue, matchedIssue, status, reasoning) {
         const statusLabel = status === 'duplicate' ? 'potential duplicate' : 'related issue';
-        const similarity = (matchedIssue.similarity * 100).toFixed(1);
+        const similarity = this.formatSimilarityPercent(matchedIssue.similarity);
         let comment = `🔁 **Linked by PRism**\n\n`;
         comment += `Issue [#${sourceIssue.number}](${sourceIssue.html_url}) was flagged as a ${statusLabel} of this issue (${similarity}% similar).\n\n`;
         comment += `- Source issue: [#${sourceIssue.number}](${sourceIssue.html_url}) - ${sourceIssue.title}\n`;

@@ -400,6 +400,103 @@ describe('TriageService issue dedupe clarity', () => {
       ['duplicate']
     );
   });
+
+  it('normalizes percent-scale similarity values before rendering issue comments', async () => {
+    const storage = makeStorage();
+    const config: Config = {
+      ...baseConfig,
+      enableDuplicateDetection: true,
+      enableLabeling: false,
+      enablePrReview: false,
+    };
+
+    storage.findSimilar.mockResolvedValueOnce([
+      {
+        number: 100,
+        title: 'OAuth callback timeout',
+        url: 'https://github.com/example-org/example-repo/issues/100',
+        similarity: 0.9,
+        type: 'issue',
+      },
+    ]);
+
+    jest.spyOn(LLMService.prototype, 'generateEmbedding').mockResolvedValue([0.1, 0.2, 0.3]);
+    jest.spyOn(LLMService.prototype, 'detectDuplicate').mockResolvedValue({
+      isDuplicate: true,
+      similarItems: [
+        {
+          number: 100,
+          title: 'OAuth callback timeout',
+          url: 'https://github.com/example-org/example-repo/issues/100',
+          similarity: 86.6,
+        },
+      ],
+      reasoning: 'This is effectively the same OAuth flow failure.',
+    });
+
+    jest.spyOn(GitHubService.prototype, 'getIssue').mockResolvedValue({
+      number: 100,
+      title: 'OAuth callback timeout',
+      body: 'OAuth callback can time out after redirect.',
+      html_url: 'https://github.com/example-org/example-repo/issues/100',
+    } as any);
+    jest.spyOn(GitHubService.prototype, 'getIssueComments').mockResolvedValue([]);
+    const postIssueCommentSpy = jest.spyOn(GitHubService.prototype, 'postIssueComment').mockResolvedValue();
+
+    const triage = new TriageService(config, storage);
+    await triage.processIssue(issueEventFixture as any);
+
+    const commentBodies = postIssueCommentSpy.mock.calls.map((call) => String(call[3]));
+    expect(commentBodies.some((body) => body.includes('86.6% similar'))).toBe(true);
+    expect(commentBodies.some((body) => body.includes('8660.0% similar'))).toBe(false);
+  });
+
+  it('normalizes low percent-style similarity before classification', async () => {
+    const storage = makeStorage();
+    const config: Config = {
+      ...baseConfig,
+      enableDuplicateDetection: true,
+      enableLabeling: false,
+      enablePrReview: false,
+    };
+
+    storage.findSimilar.mockResolvedValueOnce([
+      {
+        number: 100,
+        title: 'Only loosely related issue',
+        url: 'https://github.com/example-org/example-repo/issues/100',
+        similarity: 0.8,
+        type: 'issue',
+      },
+    ]);
+
+    jest.spyOn(LLMService.prototype, 'generateEmbedding').mockResolvedValue([0.1, 0.2, 0.3]);
+    jest.spyOn(LLMService.prototype, 'detectDuplicate').mockResolvedValue({
+      isDuplicate: true,
+      similarItems: [
+        {
+          number: 100,
+          title: 'Only loosely related issue',
+          url: 'https://github.com/example-org/example-repo/issues/100',
+          similarity: 2,
+        },
+      ],
+      reasoning: 'The overlap is weak despite a duplicate flag.',
+    });
+
+    jest.spyOn(GitHubService.prototype, 'getIssue').mockResolvedValue({
+      number: 100,
+      title: 'Only loosely related issue',
+      body: 'Minor overlap only.',
+      html_url: 'https://github.com/example-org/example-repo/issues/100',
+    } as any);
+    const postIssueCommentSpy = jest.spyOn(GitHubService.prototype, 'postIssueComment').mockResolvedValue();
+
+    const triage = new TriageService(config, storage);
+    await triage.processIssue(issueEventFixture as any);
+
+    expect(postIssueCommentSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('TriageService SHA caching behavior', () => {

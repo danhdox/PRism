@@ -133,7 +133,7 @@ export class TriageService {
     const issues = items.filter(item => item.type === 'issue');
     const prs = items.filter(item => item.type === 'pr');
     const formatList = (rows: BacklogItem[]) => rows
-      .map(item => `- [#${item.number}](${item.url}) ${item.title} — score ${item.score} (${item.dedupeStatus}, ${(item.similarity * 100).toFixed(1)}%)`)
+      .map(item => `- [#${item.number}](${item.url}) ${item.title} — score ${item.score} (${item.dedupeStatus}, ${this.formatSimilarityPercent(item.similarity)}%)`)
       .join('\n');
 
     let body = '## PRism backlog scan\n\n';
@@ -192,7 +192,8 @@ export class TriageService {
         })
       );
 
-      const result = await this.llm.detectDuplicate(issue.title, issue.body || '', similarIssuesWithBody);
+      const rawResult = await this.llm.detectDuplicate(issue.title, issue.body || '', similarIssuesWithBody);
+      const result = this.normalizeDuplicateResult(rawResult);
       const classification = this.classifyDedupeResult(result);
 
       if (classification.status === 'duplicate') {
@@ -251,7 +252,8 @@ export class TriageService {
         })
       );
 
-      const result = await this.llm.detectDuplicate(pr.title, pr.body || '', similarPrsWithBody);
+      const rawResult = await this.llm.detectDuplicate(pr.title, pr.body || '', similarPrsWithBody);
+      const result = this.normalizeDuplicateResult(rawResult);
       const classification = this.classifyDedupeResult(result);
 
       if (classification.status === 'duplicate') {
@@ -478,7 +480,7 @@ export class TriageService {
     isDuplicate: boolean;
     similarItems: Array<{ similarity: number }>;
   }): { status: DedupeStatus; similarity: number } {
-    const similarity = result.similarItems[0]?.similarity ?? 0;
+    const similarity = this.normalizeSimilarity(result.similarItems[0]?.similarity ?? 0);
     const relatedThreshold = Math.max(0, this.config.duplicateThreshold - 0.1);
 
     if (result.isDuplicate && similarity >= this.config.duplicateThreshold) {
@@ -583,8 +585,36 @@ export class TriageService {
       })
     );
 
-    const result = await this.llm.detectDuplicate(title, body, similarWithBody);
+    const rawResult = await this.llm.detectDuplicate(title, body, similarWithBody);
+    const result = this.normalizeDuplicateResult(rawResult);
     return this.classifyDedupeResult(result);
+  }
+
+  private normalizeSimilarity(similarity: number): number {
+    if (!Number.isFinite(similarity) || similarity <= 0) {
+      return 0;
+    }
+    if (similarity <= 1) {
+      return similarity;
+    }
+    if (similarity <= 100) {
+      return similarity / 100;
+    }
+    return 1;
+  }
+
+  private formatSimilarityPercent(similarity: number): string {
+    return (this.normalizeSimilarity(similarity) * 100).toFixed(1);
+  }
+
+  private normalizeDuplicateResult<T extends { similarItems: Array<{ similarity: number }> }>(result: T): T {
+    return {
+      ...result,
+      similarItems: result.similarItems.map((item) => ({
+        ...item,
+        similarity: this.normalizeSimilarity(item.similarity),
+      })),
+    };
   }
 
   private scoreBacklogEntry(input: ScoringInputs): BacklogScore {
@@ -704,7 +734,7 @@ export class TriageService {
     comment += `This ${type} appears to be similar to:\n\n`;
 
     for (const item of result.similarItems) {
-      const percentage = (item.similarity * 100).toFixed(1);
+      const percentage = this.formatSimilarityPercent(item.similarity);
       comment += `- [#${item.number}](${item.url}) - ${item.title} (${percentage}% similar)\n`;
     }
 
@@ -722,7 +752,7 @@ export class TriageService {
     comment += `This ${type} appears to be related to:\n\n`;
 
     for (const item of result.similarItems) {
-      const percentage = (item.similarity * 100).toFixed(1);
+      const percentage = this.formatSimilarityPercent(item.similarity);
       comment += `- [#${item.number}](${item.url}) - ${item.title} (${percentage}% similar)\n`;
     }
 
@@ -740,7 +770,7 @@ export class TriageService {
     reasoning: string
   ): string {
     const statusLabel = status === 'duplicate' ? 'potential duplicate' : 'related issue';
-    const similarity = (matchedIssue.similarity * 100).toFixed(1);
+    const similarity = this.formatSimilarityPercent(matchedIssue.similarity);
     let comment = `🔁 **Linked by PRism**\n\n`;
     comment += `Issue [#${sourceIssue.number}](${sourceIssue.html_url}) was flagged as a ${statusLabel} of this issue (${similarity}% similar).\n\n`;
     comment += `- Source issue: [#${sourceIssue.number}](${sourceIssue.html_url}) - ${sourceIssue.title}\n`;
