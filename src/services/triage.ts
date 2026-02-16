@@ -259,10 +259,12 @@ export class TriageService {
       if (classification.status === 'duplicate') {
         const comment = this.formatDuplicateComment(result, 'pr');
         await this.github.postPullRequestComment(owner, repo, pr.number, comment);
+        await this.applyIssueDedupeLabels(owner, repo, [pr.number, result.similarItems[0]?.number ?? 0], classification.status);
         core.info(`Posted duplicate detection comment for PR #${pr.number}`);
       } else if (classification.status === 'related') {
         const comment = this.formatRelatedComment(result, 'pr');
         await this.github.postPullRequestComment(owner, repo, pr.number, comment);
+        await this.applyIssueDedupeLabels(owner, repo, [pr.number, result.similarItems[0]?.number ?? 0], classification.status);
         core.info(`Posted related-item comment for PR #${pr.number}`);
       } else {
         core.info('PR is not a duplicate');

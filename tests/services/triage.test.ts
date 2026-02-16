@@ -273,6 +273,77 @@ describe('TriageService label triggers', () => {
     );
     expect(addLabelsSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('applies duplicate dedupe label on both source and matched PRs when available', async () => {
+    const storage = makeStorage();
+    const config: Config = {
+      ...baseConfig,
+      enableDuplicateDetection: true,
+      enablePrReview: false,
+      enableLabeling: true,
+    };
+
+    storage.findSimilar.mockResolvedValueOnce([
+      {
+        number: 12,
+        title: 'Existing OAuth timeout PR',
+        url: 'https://github.com/example-org/example-repo/pull/12',
+        similarity: 0.93,
+        type: 'pr',
+      },
+    ]);
+
+    jest.spyOn(LLMService.prototype, 'generateEmbedding').mockResolvedValue([0.1, 0.2, 0.3]);
+    jest.spyOn(LLMService.prototype, 'detectDuplicate').mockResolvedValue({
+      isDuplicate: true,
+      similarItems: [
+        {
+          number: 12,
+          title: 'Existing OAuth timeout PR',
+          url: 'https://github.com/example-org/example-repo/pull/12',
+          similarity: 0.93,
+        },
+      ],
+      reasoning: 'These PRs solve the same OAuth callback timeout behavior.',
+    });
+    jest.spyOn(LLMService.prototype, 'suggestLabels').mockResolvedValue({
+      labels: [],
+      reasoning: 'No extra labels needed.',
+    });
+
+    jest.spyOn(GitHubService.prototype, 'getPullRequest').mockResolvedValue({
+      number: 12,
+      title: 'Existing OAuth timeout PR',
+      body: 'Existing PR body',
+      html_url: 'https://github.com/example-org/example-repo/pull/12',
+    } as any);
+    jest.spyOn(GitHubService.prototype, 'getRepositoryLabels').mockResolvedValue(['duplicate', 'documentation', 'needs-review']);
+
+    const postPrCommentSpy = jest.spyOn(GitHubService.prototype, 'postPullRequestComment').mockResolvedValue();
+    const addLabelsSpy = jest.spyOn(GitHubService.prototype, 'addLabels').mockResolvedValue();
+
+    const triage = new TriageService(config, storage);
+    await triage.processPullRequest(prEventFixture as any);
+
+    expect(postPrCommentSpy).toHaveBeenCalledWith(
+      'example-org',
+      'example-repo',
+      prEventFixture.pull_request.number,
+      expect.stringContaining('Potential Duplicate Detected')
+    );
+    expect(addLabelsSpy).toHaveBeenCalledWith(
+      'example-org',
+      'example-repo',
+      prEventFixture.pull_request.number,
+      ['duplicate']
+    );
+    expect(addLabelsSpy).toHaveBeenCalledWith(
+      'example-org',
+      'example-repo',
+      12,
+      ['duplicate']
+    );
+  });
 });
 
 describe('TriageService issue dedupe clarity', () => {
