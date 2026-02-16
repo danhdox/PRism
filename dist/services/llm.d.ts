@@ -1,8 +1,11 @@
-import { Config, DuplicateResult, PrReview, LabelSuggestion } from '../types';
+import { Config, DuplicateResult, PrReview, LabelSuggestion, VisionAlignment } from '../types';
 export declare class LLMService {
     private client;
     private model;
+    private readonly parseRetryCount;
     constructor(config: Config);
+    private parseLlmResponse;
+    private sanitizeJson;
     /**
      * Generate embedding for text using OpenAI API
      */
@@ -29,6 +32,10 @@ export declare class LLMService {
      * Suggest labels for an issue or PR
      */
     suggestLabels(title: string, body: string, type: 'issue' | 'pr', existingLabels: string[]): Promise<LabelSuggestion>;
+    /**
+     * Assess PR alignment against a repository vision statement
+     */
+    assessVisionAlignment(title: string, body: string, visionDocument: string, reviewSummary: string): Promise<VisionAlignment>;
     /**
      * Calculate cosine similarity between two vectors
      */

@@ -5,11 +5,11 @@ export declare class GitHubService {
     /**
      * Get all issues from the repository
      */
-    getIssues(owner: string, repo: string): Promise<any[]>;
+    getIssues(owner: string, repo: string, state?: 'open' | 'closed' | 'all'): Promise<any[]>;
     /**
      * Get all pull requests from the repository
      */
-    getPullRequests(owner: string, repo: string): Promise<any[]>;
+    getPullRequests(owner: string, repo: string, state?: 'open' | 'closed' | 'all'): Promise<any[]>;
     /**
      * Get PR diff content
      */
@@ -22,6 +22,10 @@ export declare class GitHubService {
      * Post a comment on an issue
      */
     postIssueComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void>;
+    /**
+     * Get all comments for an issue
+     */
+    getIssueComments(owner: string, repo: string, issueNumber: number): Promise<any[]>;
     /**
      * Post a comment on a PR
      */

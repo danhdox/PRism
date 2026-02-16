@@ -47203,7 +47203,7 @@ async function run() {
     try {
         // Validate context
         if (!(0, config_1.validateContext)()) {
-            core.info('Action only runs on issues and pull_request events. Skipping.');
+            core.info('Action only runs on issue/PR/backlog events. Skipping.');
             return;
         }
         const eventType = (0, config_1.getEventType)();
@@ -47233,6 +47233,23 @@ async function run() {
             else if (eventType === 'pull_request') {
                 const payload = context.payload;
                 await triage.processPullRequest(payload);
+            }
+            else if (eventType === 'backlog') {
+                if (!config.runBacklog) {
+                    core.info('Backlog run disabled (run-backlog=false). Skipping.');
+                }
+                else if (!context.payload.repository?.full_name) {
+                    throw new Error('Missing repository context for backlog run.');
+                }
+                else {
+                    const [owner, repo] = context.payload.repository.full_name.split('/');
+                    const reportItems = await triage.processBacklog(owner, repo);
+                    core.info(`Backlog scan completed: ${reportItems.length} item(s) scored.`);
+                    if (config.backlogReportIssue) {
+                        await triage.postBacklogReport(owner, repo, config.backlogReportIssue, reportItems);
+                        core.info(`Posted backlog report to issue #${config.backlogReportIssue}`);
+                    }
+                }
             }
             const duration = ((Date.now() - startTime) / 1000).toFixed(2);
             core.info(`✅ Triage completed successfully in ${duration}s`);
@@ -47313,11 +47330,11 @@ class GitHubService {
     /**
      * Get all issues from the repository
      */
-    async getIssues(owner, repo) {
+    async getIssues(owner, repo, state = 'all') {
         const issues = await this.octokit.paginate(this.octokit.rest.issues.listForRepo, {
             owner,
             repo,
-            state: 'all',
+            state,
             per_page: 100,
         });
         // Filter out pull requests (they're also returned by issues endpoint)
@@ -47326,11 +47343,11 @@ class GitHubService {
     /**
      * Get all pull requests from the repository
      */
-    async getPullRequests(owner, repo) {
+    async getPullRequests(owner, repo, state = 'all') {
         return await this.octokit.paginate(this.octokit.rest.pulls.list, {
             owner,
             repo,
-            state: 'all',
+            state,
             per_page: 100,
         });
     }
@@ -47368,6 +47385,17 @@ class GitHubService {
             repo,
             issue_number: issueNumber,
             body,
+        });
+    }
+    /**
+     * Get all comments for an issue
+     */
+    async getIssueComments(owner, repo, issueNumber) {
+        return await this.octokit.paginate(this.octokit.rest.issues.listComments, {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: 100,
         });
     }
     /**
@@ -47448,11 +47476,40 @@ const types_1 = __nccwpck_require__(1569);
 class LLMService {
     client;
     model;
+    parseRetryCount = 2;
     constructor(config) {
         this.client = new openai_1.default({
             apiKey: config.llmApiKey,
         });
         this.model = config.llmModel;
+    }
+    async parseLlmResponse(responseFactory, schema, fallback) {
+        for (let attempt = 0; attempt <= this.parseRetryCount; attempt++) {
+            try {
+                const content = this.sanitizeJson(await responseFactory());
+                return schema.parse(JSON.parse(content));
+            }
+            catch {
+                // Retry on parse or schema validation errors
+            }
+        }
+        return fallback;
+    }
+    sanitizeJson(content) {
+        if (!content) {
+            return '';
+        }
+        const trimmed = content.trim();
+        const fencedMatch = trimmed.match(/```(?:json)?\n([\s\S]*?)```/i);
+        if (fencedMatch?.[1]) {
+            return fencedMatch[1].trim();
+        }
+        const firstBrace = trimmed.indexOf('{');
+        const lastBrace = trimmed.lastIndexOf('}');
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+            return trimmed.slice(firstBrace, lastBrace + 1).trim();
+        }
+        return trimmed;
     }
     /**
      * Generate embedding for text using OpenAI API
@@ -47501,22 +47558,26 @@ Respond with a JSON object:
   "reasoning": "Detailed explanation of your decision"
 }
 
-Only include items you consider duplicates in similarItems. If not a duplicate, return empty array.`;
-        const response = await this.client.chat.completions.create({
-            model: this.model,
-            messages: [
-                { role: 'system', content: 'You are a helpful GitHub issue triage assistant. Always respond with valid JSON.' },
-                { role: 'user', content: prompt }
-            ],
-            temperature: 0.3,
-            response_format: { type: 'json_object' },
+If items are clearly duplicates, include those items in similarItems.
+If items are not duplicates but are semantically related, still include the strongest related items in similarItems.
+If there is no meaningful overlap, return empty array.`;
+        const responseFactory = async () => {
+            const response = await this.client.chat.completions.create({
+                model: this.model,
+                messages: [
+                    { role: 'system', content: 'You are a helpful GitHub issue triage assistant. Always respond with valid JSON.' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.3,
+                response_format: { type: 'json_object' },
+            });
+            return response.choices[0].message.content;
+        };
+        return this.parseLlmResponse(responseFactory, types_1.DuplicateResultSchema, {
+            isDuplicate: false,
+            similarItems: [],
+            reasoning: 'Unable to parse LLM duplicate classification response. Falling back to non-duplicate.',
         });
-        const content = response.choices[0].message.content;
-        if (!content) {
-            throw new Error('No response from LLM');
-        }
-        const result = JSON.parse(content);
-        return types_1.DuplicateResultSchema.parse(result);
     }
     /**
      * Generate a structured PR review
@@ -47555,21 +47616,24 @@ Respond with JSON:
   "suggestedLabels": ["label1", "label2"],
   "estimatedComplexity": "low|medium|high"
 }`;
-        const response = await this.client.chat.completions.create({
-            model: this.model,
-            messages: [
-                { role: 'system', content: 'You are a helpful code review assistant. Always respond with valid JSON.' },
-                { role: 'user', content: prompt }
-            ],
-            temperature: 0.3,
-            response_format: { type: 'json_object' },
+        const responseFactory = async () => {
+            const response = await this.client.chat.completions.create({
+                model: this.model,
+                messages: [
+                    { role: 'system', content: 'You are a helpful code review assistant. Always respond with valid JSON.' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.3,
+                response_format: { type: 'json_object' },
+            });
+            return response.choices[0].message.content;
+        };
+        return this.parseLlmResponse(responseFactory, types_1.PrReviewSchema, {
+            summary: 'AI review unavailable.',
+            findings: [],
+            suggestedLabels: [],
+            estimatedComplexity: 'low',
         });
-        const content = response.choices[0].message.content;
-        if (!content) {
-            throw new Error('No response from LLM');
-        }
-        const result = JSON.parse(content);
-        return types_1.PrReviewSchema.parse(result);
     }
     /**
      * Suggest labels for an issue or PR
@@ -47593,21 +47657,61 @@ Respond with JSON:
   "labels": ["label1", "label2"],
   "reasoning": "Brief explanation of label choices"
 }`;
-        const response = await this.client.chat.completions.create({
-            model: this.model,
-            messages: [
-                { role: 'system', content: 'You are a helpful labeling assistant. Always respond with valid JSON.' },
-                { role: 'user', content: prompt }
-            ],
-            temperature: 0.3,
-            response_format: { type: 'json_object' },
+        const responseFactory = async () => {
+            const response = await this.client.chat.completions.create({
+                model: this.model,
+                messages: [
+                    { role: 'system', content: 'You are a helpful labeling assistant. Always respond with valid JSON.' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.3,
+                response_format: { type: 'json_object' },
+            });
+            return response.choices[0].message.content;
+        };
+        return this.parseLlmResponse(responseFactory, types_1.LabelSuggestionSchema, {
+            labels: [],
+            reasoning: 'Unable to parse label suggestions. No labels were applied.',
         });
-        const content = response.choices[0].message.content;
-        if (!content) {
-            throw new Error('No response from LLM');
-        }
-        const result = JSON.parse(content);
-        return types_1.LabelSuggestionSchema.parse(result);
+    }
+    /**
+     * Assess PR alignment against a repository vision statement
+     */
+    async assessVisionAlignment(title, body, visionDocument, reviewSummary) {
+        const prompt = `You are a product strategy validator.
+
+Vision document:
+${visionDocument}
+
+PR title: ${title}
+PR body: ${body || 'No description provided'}
+PR review summary: ${reviewSummary}
+
+Return JSON:
+{
+  "fit": "aligned|off-track|neutral",
+  "score": 0.0,
+  "concerns": ["string"],
+  "recommendation": "string"
+}`;
+        const responseFactory = async () => {
+            const response = await this.client.chat.completions.create({
+                model: this.model,
+                messages: [
+                    { role: 'system', content: 'You are a strict product strategy review assistant. Return valid JSON.' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.2,
+                response_format: { type: 'json_object' },
+            });
+            return response.choices[0].message.content;
+        };
+        return this.parseLlmResponse(responseFactory, types_1.VisionAlignmentSchema, {
+            fit: 'neutral',
+            score: 0.5,
+            concerns: [],
+            recommendation: 'Unable to parse PR vision assessment. Treat as neutral.',
+        });
     }
     /**
      * Calculate cosine similarity between two vectors
@@ -47620,11 +47724,18 @@ Respond with JSON:
         let normA = 0;
         let normB = 0;
         for (let i = 0; i < a.length; i++) {
+            if (!Number.isFinite(a[i]) || !Number.isFinite(b[i])) {
+                throw new Error('Vectors must contain finite values');
+            }
             dotProduct += a[i] * b[i];
             normA += a[i] * a[i];
             normB += b[i] * b[i];
         }
-        return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+        const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+        if (denominator === 0) {
+            return 0;
+        }
+        return dotProduct / denominator;
     }
 }
 exports.LLMService = LLMService;
@@ -47830,6 +47941,7 @@ exports.TriageService = void 0;
 const core = __importStar(__nccwpck_require__(7484));
 const llm_1 = __nccwpck_require__(243);
 const github_1 = __nccwpck_require__(7865);
+const scoring_1 = __nccwpck_require__(2940);
 class TriageService {
     config;
     storage;
@@ -47849,11 +47961,9 @@ class TriageService {
         const [owner, repo] = repository.full_name.split('/');
         core.info(`Processing issue #${issue.number}: ${issue.title}`);
         const tasks = [];
-        // Duplicate detection
         if (this.config.enableDuplicateDetection) {
             tasks.push(this.detectIssueDuplicate(owner, repo, issue));
         }
-        // Label suggestion
         if (this.config.enableLabeling) {
             tasks.push(this.suggestIssueLabels(owner, repo, issue));
         }
@@ -47867,19 +47977,61 @@ class TriageService {
         const [owner, repo] = repository.full_name.split('/');
         core.info(`Processing PR #${pull_request.number}: ${pull_request.title}`);
         const tasks = [];
-        // Duplicate detection
         if (this.config.enableDuplicateDetection) {
             tasks.push(this.detectPrDuplicate(owner, repo, pull_request));
         }
-        // PR review
         if (this.config.enablePrReview) {
             tasks.push(this.generatePrReview(owner, repo, pull_request));
         }
-        // Label suggestion
         if (this.config.enableLabeling) {
             tasks.push(this.suggestPrLabels(owner, repo, pull_request));
         }
         await Promise.all(tasks);
+    }
+    /**
+     * Process a backlog scan for open issues and PRs.
+     * Returns ranked items with score reasoning.
+     */
+    async processBacklog(owner, repo) {
+        const limit = this.config.backlogLimit ?? 200;
+        core.info(`Running backlog scan for ${owner}/${repo} (limit=${limit})`);
+        const [issues, prs] = await Promise.all([
+            this.github.getIssues(owner, repo, 'open'),
+            this.github.getPullRequests(owner, repo, 'open'),
+        ]);
+        const scanned = await Promise.all([
+            ...issues.slice(0, limit).map((issue) => this.evaluateIssueForBacklog(owner, repo, issue)),
+            ...prs.slice(0, Math.max(0, limit - issues.length)).map((pr) => this.evaluatePrForBacklog(owner, repo, pr)),
+        ]);
+        return scanned
+            .filter((item) => Boolean(item))
+            .sort((a, b) => b.score - a.score);
+    }
+    buildBacklogReport(items) {
+        if (items.length === 0) {
+            return 'No open issues or pull requests need immediate attention from this scan.';
+        }
+        const issues = items.filter(item => item.type === 'issue');
+        const prs = items.filter(item => item.type === 'pr');
+        const formatList = (rows) => rows
+            .map(item => `- [#${item.number}](${item.url}) ${item.title} — score ${item.score} (${item.dedupeStatus}, ${(item.similarity * 100).toFixed(1)}%)`)
+            .join('\n');
+        let body = '## PRism backlog scan\n\n';
+        body += 'Prioritized open issues and PRs:\n\n';
+        if (issues.length > 0) {
+            body += '### Issues\n';
+            body += `${formatList(issues)}\n\n`;
+        }
+        if (prs.length > 0) {
+            body += '### Pull Requests\n';
+            body += `${formatList(prs)}\n\n`;
+        }
+        body += `Generated by PRism on ${new Date().toISOString()}.`;
+        return body;
+    }
+    async postBacklogReport(owner, repo, issueNumber, items) {
+        const report = this.buildBacklogReport(items);
+        await this.github.postIssueComment(owner, repo, issueNumber, report);
     }
     /**
      * Detect duplicate issues
@@ -47887,19 +48039,14 @@ class TriageService {
     async detectIssueDuplicate(owner, repo, issue) {
         try {
             core.info(`Checking for duplicate issues for #${issue.number}`);
-            // Generate embedding for the issue
             const text = `${issue.title}\n\n${issue.body || ''}`;
             const embedding = await this.llm.generateEmbedding(text);
-            // Store embedding with SHA-based caching
-            const cacheKey = `issue-${issue.number}`;
-            await this.storage.storeEmbedding(cacheKey, embedding);
-            // Find similar issues
+            await this.storage.storeEmbedding(`issue-${issue.number}`, embedding);
             const similarItems = await this.findSimilarIssues(owner, repo, embedding, issue.number);
             if (similarItems.length === 0) {
                 core.info('No similar issues found');
                 return;
             }
-            // Get full issue details for similar items
             const similarIssuesWithBody = await Promise.all(similarItems.slice(0, 5).map(async (item) => {
                 const fullIssue = await this.github.getIssue(owner, repo, item.number);
                 return {
@@ -47910,13 +48057,23 @@ class TriageService {
                     similarity: item.similarity,
                 };
             }));
-            // Use LLM to determine if it's a duplicate
             const result = await this.llm.detectDuplicate(issue.title, issue.body || '', similarIssuesWithBody);
-            // Post comment
-            if (result.isDuplicate && result.similarItems.length > 0) {
+            const classification = this.classifyDedupeResult(result);
+            if (classification.status === 'duplicate') {
                 const comment = this.formatDuplicateComment(result, 'issue');
-                await this.github.postIssueComment(owner, repo, issue.number, comment);
+                const signalTag = `prism-issue-signal:duplicate:${result.similarItems[0]?.number ?? 'none'}`;
+                await this.postIssueSignalCommentIfNew(owner, repo, issue.number, comment, signalTag);
+                await this.postIssueCrossReference(owner, repo, issue, result, classification.status);
+                await this.applyIssueDedupeLabels(owner, repo, [issue.number, result.similarItems[0]?.number ?? 0], classification.status);
                 core.info(`Posted duplicate detection comment for issue #${issue.number}`);
+            }
+            else if (classification.status === 'related') {
+                const comment = this.formatRelatedComment(result, 'issue');
+                const signalTag = `prism-issue-signal:related:${result.similarItems[0]?.number ?? 'none'}`;
+                await this.postIssueSignalCommentIfNew(owner, repo, issue.number, comment, signalTag);
+                await this.postIssueCrossReference(owner, repo, issue, result, classification.status);
+                await this.applyIssueDedupeLabels(owner, repo, [issue.number, result.similarItems[0]?.number ?? 0], classification.status);
+                core.info(`Posted related-item comment for issue #${issue.number}`);
             }
             else {
                 core.info('Issue is not a duplicate');
@@ -47932,19 +48089,14 @@ class TriageService {
     async detectPrDuplicate(owner, repo, pr) {
         try {
             core.info(`Checking for duplicate PRs for #${pr.number}`);
-            // Generate embedding for the PR
             const text = `${pr.title}\n\n${pr.body || ''}`;
             const embedding = await this.llm.generateEmbedding(text);
-            // Store embedding with SHA-based caching
-            const cacheKey = `pr-${pr.head.sha}`;
-            await this.storage.storeEmbedding(cacheKey, embedding);
-            // Find similar PRs
+            await this.storage.storeEmbedding(`pr-${pr.head.sha}`, embedding);
             const similarItems = await this.findSimilarPrs(owner, repo, embedding, pr.number);
             if (similarItems.length === 0) {
                 core.info('No similar PRs found');
                 return;
             }
-            // Get full PR details for similar items
             const similarPrsWithBody = await Promise.all(similarItems.slice(0, 5).map(async (item) => {
                 const fullPr = await this.github.getPullRequest(owner, repo, item.number);
                 return {
@@ -47955,13 +48107,17 @@ class TriageService {
                     similarity: item.similarity,
                 };
             }));
-            // Use LLM to determine if it's a duplicate
             const result = await this.llm.detectDuplicate(pr.title, pr.body || '', similarPrsWithBody);
-            // Post comment
-            if (result.isDuplicate && result.similarItems.length > 0) {
+            const classification = this.classifyDedupeResult(result);
+            if (classification.status === 'duplicate') {
                 const comment = this.formatDuplicateComment(result, 'pr');
                 await this.github.postPullRequestComment(owner, repo, pr.number, comment);
                 core.info(`Posted duplicate detection comment for PR #${pr.number}`);
+            }
+            else if (classification.status === 'related') {
+                const comment = this.formatRelatedComment(result, 'pr');
+                await this.github.postPullRequestComment(owner, repo, pr.number, comment);
+                core.info(`Posted related-item comment for PR #${pr.number}`);
             }
             else {
                 core.info('PR is not a duplicate');
@@ -47977,22 +48133,18 @@ class TriageService {
     async generatePrReview(owner, repo, pr) {
         try {
             core.info(`Generating review for PR #${pr.number}`);
-            // Get PR diff and files
             const [diff, files] = await Promise.all([
                 this.github.getPullRequestDiff(owner, repo, pr.number),
                 this.github.getPullRequestFiles(owner, repo, pr.number),
             ]);
-            // Generate review
-            const review = await this.llm.generatePrReview(pr.title, pr.body || '', diff, files.map(f => ({
+            const review = await this.llm.generatePrReview(pr.title, pr.body || '', diff, files.map((f) => ({
                 filename: f.filename,
                 additions: f.additions,
                 deletions: f.deletions,
             })));
-            // Post review comment
             const comment = this.formatReviewComment(review);
             await this.github.postPullRequestComment(owner, repo, pr.number, comment);
             core.info(`Posted review comment for PR #${pr.number}`);
-            // Apply suggested labels
             if (this.config.enableLabeling && review.suggestedLabels.length > 0) {
                 const repoLabels = await this.github.getRepositoryLabels(owner, repo);
                 const validLabels = review.suggestedLabels.filter(label => repoLabels.includes(label));
@@ -48014,9 +48166,10 @@ class TriageService {
             core.info(`Suggesting labels for issue #${issue.number}`);
             const repoLabels = await this.github.getRepositoryLabels(owner, repo);
             const suggestion = await this.llm.suggestLabels(issue.title, issue.body || '', 'issue', repoLabels);
-            if (suggestion.labels.length > 0) {
-                await this.github.addLabels(owner, repo, issue.number, suggestion.labels);
-                core.info(`Applied labels to issue #${issue.number}: ${suggestion.labels.join(', ')}`);
+            const validLabels = suggestion.labels.filter(label => repoLabels.includes(label));
+            if (validLabels.length > 0) {
+                await this.github.addLabels(owner, repo, issue.number, validLabels);
+                core.info(`Applied labels to issue #${issue.number}: ${validLabels.join(', ')}`);
             }
         }
         catch (error) {
@@ -48031,9 +48184,10 @@ class TriageService {
             core.info(`Suggesting labels for PR #${pr.number}`);
             const repoLabels = await this.github.getRepositoryLabels(owner, repo);
             const suggestion = await this.llm.suggestLabels(pr.title, pr.body || '', 'pr', repoLabels);
-            if (suggestion.labels.length > 0) {
-                await this.github.addLabels(owner, repo, pr.number, suggestion.labels);
-                core.info(`Applied labels to PR #${pr.number}: ${suggestion.labels.join(', ')}`);
+            const validLabels = suggestion.labels.filter(label => repoLabels.includes(label));
+            if (validLabels.length > 0) {
+                await this.github.addLabels(owner, repo, pr.number, validLabels);
+                core.info(`Applied labels to PR #${pr.number}: ${validLabels.join(', ')}`);
             }
         }
         catch (error) {
@@ -48041,20 +48195,190 @@ class TriageService {
         }
     }
     /**
+     * Evaluate one issue in backlog scan
+     */
+    async evaluateIssueForBacklog(owner, repo, issue) {
+        const text = `${issue.title}\n\n${issue.body || ''}`;
+        const embedding = await this.llm.generateEmbedding(text);
+        await this.storage.storeEmbedding(`issue-${issue.number}`, embedding);
+        const similarItems = await this.findSimilarIssues(owner, repo, embedding, issue.number, 'open');
+        const duplicateResult = await this.resolveDuplicateStatus(owner, repo, issue.title, issue.body || '', similarItems);
+        const score = this.scoreBacklogEntry({
+            type: 'issue',
+            dedupeStatus: duplicateResult.status,
+            similarity: duplicateResult.similarity,
+        });
+        return {
+            type: 'issue',
+            number: issue.number,
+            title: issue.title,
+            url: issue.html_url,
+            dedupeStatus: duplicateResult.status,
+            similarity: duplicateResult.similarity,
+            score: score.score,
+            reasons: score.reasons,
+        };
+    }
+    /**
+     * Evaluate one PR in backlog scan
+     */
+    async evaluatePrForBacklog(owner, repo, pr) {
+        const text = `${pr.title}\n\n${pr.body || ''}`;
+        const embedding = await this.llm.generateEmbedding(text);
+        await this.storage.storeEmbedding(`pr-${pr.head.sha}`, embedding);
+        const similarItems = await this.findSimilarPrs(owner, repo, embedding, pr.number, 'open');
+        const duplicateResult = await this.resolveDuplicateStatus(owner, repo, pr.title, pr.body || '', similarItems);
+        let visionAlignment;
+        let review = null;
+        const scoringInputs = {
+            type: 'pr',
+            dedupeStatus: duplicateResult.status,
+            similarity: duplicateResult.similarity,
+        };
+        if (this.config.enablePrReview) {
+            try {
+                const [diff, files] = await Promise.all([
+                    this.github.getPullRequestDiff(owner, repo, pr.number),
+                    this.github.getPullRequestFiles(owner, repo, pr.number),
+                ]);
+                review = await this.llm.generatePrReview(pr.title, pr.body || '', diff, files.map((f) => ({
+                    filename: f.filename,
+                    additions: f.additions,
+                    deletions: f.deletions,
+                })));
+            }
+            catch (error) {
+                core.error(`Backlog review generation failed for PR #${pr.number}: ${error}`);
+            }
+        }
+        if (review) {
+            scoringInputs.reviewComplexity = review.estimatedComplexity;
+            scoringInputs.severityCounts = this.getSeverityCounts(review.findings || []);
+            if (this.config.visionDocument) {
+                visionAlignment = await this.llm.assessVisionAlignment(pr.title, pr.body || '', this.config.visionDocument, review.summary);
+                scoringInputs.visionAlignment = visionAlignment;
+            }
+        }
+        const scored = this.scoreBacklogEntry(scoringInputs);
+        return {
+            type: 'pr',
+            number: pr.number,
+            title: pr.title,
+            url: pr.html_url,
+            dedupeStatus: duplicateResult.status,
+            similarity: duplicateResult.similarity,
+            score: scored.score,
+            reasons: scored.reasons,
+        };
+    }
+    getSeverityCounts(findings) {
+        const severityCounts = { critical: 0, major: 0, minor: 0, info: 0 };
+        for (const finding of findings) {
+            if (finding.severity === 'critical') {
+                severityCounts.critical += 1;
+            }
+            else if (finding.severity === 'major') {
+                severityCounts.major += 1;
+            }
+            else if (finding.severity === 'minor') {
+                severityCounts.minor += 1;
+            }
+            else if (finding.severity === 'info') {
+                severityCounts.info += 1;
+            }
+        }
+        return severityCounts;
+    }
+    classifyDedupeResult(result) {
+        const similarity = result.similarItems[0]?.similarity ?? 0;
+        const relatedThreshold = Math.max(0, this.config.duplicateThreshold - 0.1);
+        if (result.isDuplicate && similarity >= this.config.duplicateThreshold) {
+            return { status: 'duplicate', similarity };
+        }
+        if (similarity >= relatedThreshold) {
+            return { status: 'related', similarity };
+        }
+        return { status: 'distinct', similarity };
+    }
+    async postIssueSignalCommentIfNew(owner, repo, issueNumber, comment, markerTag) {
+        const marker = `<!-- ${markerTag} -->`;
+        const comments = await this.github.getIssueComments(owner, repo, issueNumber);
+        const exists = comments.some((entry) => entry.body?.includes(marker));
+        if (exists) {
+            core.info(`Skipping existing issue signal comment (${markerTag}) on #${issueNumber}`);
+            return;
+        }
+        await this.github.postIssueComment(owner, repo, issueNumber, `${comment}\n\n${marker}`);
+    }
+    async postIssueCrossReference(owner, repo, issue, result, status) {
+        const reference = result.similarItems[0];
+        if (!reference || reference.number === issue.number) {
+            return;
+        }
+        const markerTag = `prism-issue-crosslink:${issue.number}:${status}`;
+        const comment = this.formatCrossLinkedIssueComment(issue, reference, status, result.reasoning);
+        await this.postIssueSignalCommentIfNew(owner, repo, reference.number, comment, markerTag);
+    }
+    async applyIssueDedupeLabels(owner, repo, issueNumbers, status) {
+        if (!this.config.enableLabeling) {
+            return;
+        }
+        const repoLabels = await this.github.getRepositoryLabels(owner, repo);
+        const preferredLabels = status === 'duplicate'
+            ? ['duplicate', 'possible-duplicate', 'triage:duplicate', 'dedupe']
+            : ['related', 'possible-related', 'triage:related'];
+        const selectedLabel = preferredLabels.find((label) => repoLabels.includes(label));
+        if (!selectedLabel) {
+            core.info(`No repository label available for ${status} signals.`);
+            return;
+        }
+        const uniqueIssueNumbers = [...new Set(issueNumbers)].filter((number) => number > 0);
+        await Promise.all(uniqueIssueNumbers.map((number) => this.github.addLabels(owner, repo, number, [selectedLabel])));
+    }
+    async resolveDuplicateStatus(owner, repo, title, body, similarItems) {
+        if (similarItems.length === 0 || !this.config.enableDuplicateDetection) {
+            return { status: 'distinct', similarity: 0 };
+        }
+        const similarWithBody = await Promise.all(similarItems.slice(0, 5).map(async (item) => {
+            const source = item.type === 'issue'
+                ? await this.github.getIssue(owner, repo, item.number)
+                : await this.github.getPullRequest(owner, repo, item.number);
+            return {
+                number: item.number,
+                title: item.title,
+                body: source.body || '',
+                url: item.url,
+                similarity: item.similarity,
+            };
+        }));
+        const result = await this.llm.detectDuplicate(title, body, similarWithBody);
+        return this.classifyDedupeResult(result);
+    }
+    scoreBacklogEntry(input) {
+        const score = (0, scoring_1.scoreBacklogItem)({
+            itemType: input.type,
+            dedupeStatus: input.dedupeStatus,
+            duplicateSimilarity: input.similarity,
+            visionAlignment: input.visionAlignment,
+            severityCounts: input.severityCounts,
+            reviewComplexity: input.reviewComplexity,
+        });
+        return score;
+    }
+    /**
      * Find similar issues using embeddings
      */
-    async findSimilarIssues(owner, repo, embedding, excludeNumber) {
-        // Try to find from storage first
+    async findSimilarIssues(owner, repo, embedding, excludeNumber, state = 'all') {
         const similarFromDb = await this.storage.findSimilar(embedding, this.config.duplicateThreshold, 10);
         if (similarFromDb.length > 0) {
             return similarFromDb.filter(item => item.number !== excludeNumber && item.type === 'issue');
         }
-        // Fallback: get all issues and compute similarity
-        const issues = await this.github.getIssues(owner, repo);
+        const issues = await this.github.getIssues(owner, repo, state);
         const similarities = [];
         for (const issue of issues) {
-            if (issue.number === excludeNumber)
+            if (issue.number === excludeNumber) {
                 continue;
+            }
             const issueText = `${issue.title}\n\n${issue.body || ''}`;
             const issueEmbedding = await this.llm.generateEmbedding(issueText);
             const similarity = llm_1.LLMService.cosineSimilarity(embedding, issueEmbedding);
@@ -48067,7 +48391,6 @@ class TriageService {
                     type: 'issue',
                 });
             }
-            // Store for future use
             await this.storage.storeEmbedding(`issue-${issue.number}`, issueEmbedding);
         }
         return similarities.sort((a, b) => b.similarity - a.similarity).slice(0, 10);
@@ -48075,18 +48398,17 @@ class TriageService {
     /**
      * Find similar PRs using embeddings
      */
-    async findSimilarPrs(owner, repo, embedding, excludeNumber) {
-        // Try to find from storage first
+    async findSimilarPrs(owner, repo, embedding, excludeNumber, state = 'all') {
         const similarFromDb = await this.storage.findSimilar(embedding, this.config.duplicateThreshold, 10);
         if (similarFromDb.length > 0) {
             return similarFromDb.filter(item => item.number !== excludeNumber && item.type === 'pr');
         }
-        // Fallback: get all PRs and compute similarity
-        const prs = await this.github.getPullRequests(owner, repo);
+        const prs = await this.github.getPullRequests(owner, repo, state);
         const similarities = [];
         for (const pr of prs) {
-            if (pr.number === excludeNumber)
+            if (pr.number === excludeNumber) {
                 continue;
+            }
             const prText = `${pr.title}\n\n${pr.body || ''}`;
             const prEmbedding = await this.llm.generateEmbedding(prText);
             const similarity = llm_1.LLMService.cosineSimilarity(embedding, prEmbedding);
@@ -48099,7 +48421,6 @@ class TriageService {
                     type: 'pr',
                 });
             }
-            // Store for future use
             await this.storage.storeEmbedding(`pr-${pr.head.sha}`, prEmbedding);
         }
         return similarities.sort((a, b) => b.similarity - a.similarity).slice(0, 10);
@@ -48118,6 +48439,32 @@ class TriageService {
         comment += `\n**Analysis:**\n${result.reasoning}\n\n`;
         comment += `---\n`;
         comment += `*This analysis was generated by [PRism](https://github.com/danhdox/prism) AI triage.*`;
+        return comment;
+    }
+    formatRelatedComment(result, type) {
+        const emoji = type === 'issue' ? '🔗' : '🔁';
+        const typeLabel = type === 'issue' ? 'Issue' : 'PR';
+        let comment = `${emoji} **Potentially Related ${typeLabel} Detected**\n\n`;
+        comment += `This ${type} appears to be related to:\n\n`;
+        for (const item of result.similarItems) {
+            const percentage = (item.similarity * 100).toFixed(1);
+            comment += `- [#${item.number}](${item.url}) - ${item.title} (${percentage}% similar)\n`;
+        }
+        comment += `\n**Analysis:**\n${result.reasoning}\n\n`;
+        comment += `---\n`;
+        comment += `*This analysis was generated by [PRism](https://github.com/danhdox/prism) AI triage.*`;
+        return comment;
+    }
+    formatCrossLinkedIssueComment(sourceIssue, matchedIssue, status, reasoning) {
+        const statusLabel = status === 'duplicate' ? 'potential duplicate' : 'related issue';
+        const similarity = (matchedIssue.similarity * 100).toFixed(1);
+        let comment = `🔁 **Linked by PRism**\n\n`;
+        comment += `Issue [#${sourceIssue.number}](${sourceIssue.html_url}) was flagged as a ${statusLabel} of this issue (${similarity}% similar).\n\n`;
+        comment += `- Source issue: [#${sourceIssue.number}](${sourceIssue.html_url}) - ${sourceIssue.title}\n`;
+        comment += `- Match context: [#${matchedIssue.number}](${matchedIssue.url}) - ${matchedIssue.title}\n\n`;
+        comment += `**Analysis:**\n${reasoning}\n\n`;
+        comment += `---\n`;
+        comment += `*This cross-link was generated by [PRism](https://github.com/danhdox/prism) AI triage.*`;
         return comment;
     }
     /**
@@ -48204,7 +48551,7 @@ exports.TriageService = TriageService;
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.LabelSuggestionSchema = exports.PrReviewSchema = exports.DuplicateResultSchema = exports.ConfigSchema = void 0;
+exports.VisionAlignmentSchema = exports.LabelSuggestionSchema = exports.PrReviewSchema = exports.DuplicateResultSchema = exports.ConfigSchema = void 0;
 const zod_1 = __nccwpck_require__(924);
 // Configuration schema
 exports.ConfigSchema = zod_1.z.object({
@@ -48213,6 +48560,10 @@ exports.ConfigSchema = zod_1.z.object({
     llmProvider: zod_1.z.enum(['openai', 'anthropic']),
     llmModel: zod_1.z.string(),
     databaseUrl: zod_1.z.string().optional(),
+    runBacklog: zod_1.z.boolean(),
+    backlogLimit: zod_1.z.number().int().positive().max(500).optional(),
+    backlogReportIssue: zod_1.z.number().positive().int().optional(),
+    visionDocument: zod_1.z.string().optional(),
     duplicateThreshold: zod_1.z.number().min(0).max(1),
     enableDuplicateDetection: zod_1.z.boolean(),
     enablePrReview: zod_1.z.boolean(),
@@ -48247,6 +48598,12 @@ exports.PrReviewSchema = zod_1.z.object({
 exports.LabelSuggestionSchema = zod_1.z.object({
     labels: zod_1.z.array(zod_1.z.string()),
     reasoning: zod_1.z.string(),
+});
+exports.VisionAlignmentSchema = zod_1.z.object({
+    fit: zod_1.z.enum(['aligned', 'off-track', 'neutral']),
+    score: zod_1.z.number().min(0).max(1),
+    concerns: zod_1.z.array(zod_1.z.string()),
+    recommendation: zod_1.z.string(),
 });
 
 
@@ -48300,12 +48657,22 @@ const types_1 = __nccwpck_require__(1569);
  * Load configuration from GitHub Action inputs
  */
 function loadConfig() {
+    const backlogReportIssueInput = core.getInput('backlog-report-issue');
+    const backlogLimitInput = core.getInput('backlog-limit');
+    const parsedBacklogReportIssue = backlogReportIssueInput
+        ? Number.parseInt(backlogReportIssueInput, 10)
+        : undefined;
+    const parsedBacklogLimit = backlogLimitInput ? Number.parseInt(backlogLimitInput, 10) : undefined;
     const config = {
         githubToken: core.getInput('github-token', { required: true }),
         llmApiKey: core.getInput('llm-api-key', { required: true }),
         llmProvider: core.getInput('llm-provider'),
         llmModel: core.getInput('llm-model'),
         databaseUrl: core.getInput('database-url'),
+        runBacklog: core.getBooleanInput('run-backlog'),
+        backlogLimit: Number.isNaN(parsedBacklogLimit) ? undefined : parsedBacklogLimit,
+        backlogReportIssue: Number.isNaN(parsedBacklogReportIssue) ? undefined : parsedBacklogReportIssue,
+        visionDocument: core.getInput('vision-document') || undefined,
         duplicateThreshold: parseFloat(core.getInput('duplicate-threshold')),
         enableDuplicateDetection: core.getBooleanInput('enable-duplicate-detection'),
         enablePrReview: core.getBooleanInput('enable-pr-review'),
@@ -48319,7 +48686,10 @@ function loadConfig() {
  */
 function validateContext() {
     const eventName = process.env.GITHUB_EVENT_NAME;
-    return eventName === 'issues' || eventName === 'pull_request';
+    return (eventName === 'issues' ||
+        eventName === 'pull_request' ||
+        eventName === 'schedule' ||
+        eventName === 'workflow_dispatch');
 }
 /**
  * Get event type
@@ -48330,7 +48700,83 @@ function getEventType() {
         return 'issues';
     if (eventName === 'pull_request')
         return 'pull_request';
+    if (eventName === 'schedule' || eventName === 'workflow_dispatch')
+        return 'backlog';
     return 'unknown';
+}
+
+
+/***/ }),
+
+/***/ 2940:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.scoreBacklogItem = scoreBacklogItem;
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+/**
+ * Score an item discovered during backlog runs.
+ *
+ * Returns a score in the range [0, 100] where higher scores mean higher
+ * triage priority.
+ */
+function scoreBacklogItem(input) {
+    const similarity = clamp(Number.isFinite(input.duplicateSimilarity) ? input.duplicateSimilarity : 0, 0, 1);
+    const reasons = [];
+    let score = 10;
+    if (input.dedupeStatus === 'duplicate') {
+        score += 55;
+        reasons.push('High duplicate likelihood');
+    }
+    else if (input.dedupeStatus === 'related') {
+        score += 25;
+        reasons.push('Moderate duplicate signal');
+    }
+    else {
+        reasons.push('No duplicate overlap detected');
+    }
+    score += similarity * 30;
+    if (similarity > 0.9) {
+        reasons.push('Very high semantic similarity');
+    }
+    else if (similarity > 0.75) {
+        reasons.push('Strong semantic similarity');
+    }
+    if (input.itemType === 'pr') {
+        if (input.severityCounts) {
+            const critical = clamp(input.severityCounts.critical ?? 0, 0, 10);
+            const major = clamp(input.severityCounts.major ?? 0, 0, 20);
+            const minor = clamp(input.severityCounts.minor ?? 0, 0, 30);
+            score += critical * 3 + major * 1.5 + minor * 0.5;
+            if (critical > 0)
+                reasons.push(`${critical} critical finding(s)`);
+            if (major > 0)
+                reasons.push(`${major} major finding(s)`);
+        }
+        if (input.reviewComplexity === 'high') {
+            score += 5;
+            reasons.push('High review complexity');
+        }
+        else if (input.reviewComplexity === 'medium') {
+            score += 2;
+            reasons.push('Medium review complexity');
+        }
+    }
+    if (input.visionAlignment?.fit === 'off-track') {
+        score += 10;
+        reasons.push('Vision alignment mismatch');
+    }
+    else if (input.visionAlignment?.fit === 'aligned') {
+        score -= 5;
+        reasons.push('Aligns with vision goals');
+    }
+    else if (input.visionAlignment?.fit === 'neutral') {
+        reasons.push('Vision alignment is neutral');
+    }
+    score = clamp(Math.round(score), 0, 100);
+    return { score, reasons };
 }
 
 

@@ -1,5 +1,16 @@
-import { Config, IssueEvent, PullRequestEvent } from '../types';
-import { StorageBackend } from '../types';
+import { Config, IssueEvent, PullRequestEvent, StorageBackend } from '../types';
+type DedupeStatus = 'duplicate' | 'related' | 'distinct';
+type BacklogItemType = 'issue' | 'pr';
+export interface BacklogItem {
+    type: BacklogItemType;
+    number: number;
+    title: string;
+    url: string;
+    dedupeStatus: DedupeStatus;
+    similarity: number;
+    score: number;
+    reasons: string[];
+}
 export declare class TriageService {
     private config;
     private storage;
@@ -14,6 +25,13 @@ export declare class TriageService {
      * Process a pull request event
      */
     processPullRequest(event: PullRequestEvent): Promise<void>;
+    /**
+     * Process a backlog scan for open issues and PRs.
+     * Returns ranked items with score reasoning.
+     */
+    processBacklog(owner: string, repo: string): Promise<BacklogItem[]>;
+    buildBacklogReport(items: BacklogItem[]): string;
+    postBacklogReport(owner: string, repo: string, issueNumber: number, items: BacklogItem[]): Promise<void>;
     /**
      * Detect duplicate issues
      */
@@ -35,6 +53,21 @@ export declare class TriageService {
      */
     private suggestPrLabels;
     /**
+     * Evaluate one issue in backlog scan
+     */
+    private evaluateIssueForBacklog;
+    /**
+     * Evaluate one PR in backlog scan
+     */
+    private evaluatePrForBacklog;
+    private getSeverityCounts;
+    private classifyDedupeResult;
+    private postIssueSignalCommentIfNew;
+    private postIssueCrossReference;
+    private applyIssueDedupeLabels;
+    private resolveDuplicateStatus;
+    private scoreBacklogEntry;
+    /**
      * Find similar issues using embeddings
      */
     private findSimilarIssues;
@@ -46,6 +79,8 @@ export declare class TriageService {
      * Format duplicate detection comment
      */
     private formatDuplicateComment;
+    private formatRelatedComment;
+    private formatCrossLinkedIssueComment;
     /**
      * Format PR review comment
      */
@@ -55,4 +90,5 @@ export declare class TriageService {
      */
     private formatFinding;
 }
+export {};
 //# sourceMappingURL=triage.d.ts.map

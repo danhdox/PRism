@@ -10,5 +10,5 @@ export declare function validateContext(): boolean;
 /**
  * Get event type
  */
-export declare function getEventType(): 'issues' | 'pull_request' | 'unknown';
+export declare function getEventType(): 'issues' | 'pull_request' | 'backlog' | 'unknown';
 //# sourceMappingURL=config.d.ts.map

@@ -5,6 +5,10 @@ export declare const ConfigSchema: z.ZodObject<{
     llmProvider: z.ZodEnum<["openai", "anthropic"]>;
     llmModel: z.ZodString;
     databaseUrl: z.ZodOptional<z.ZodString>;
+    runBacklog: z.ZodBoolean;
+    backlogLimit: z.ZodOptional<z.ZodNumber>;
+    backlogReportIssue: z.ZodOptional<z.ZodNumber>;
+    visionDocument: z.ZodOptional<z.ZodString>;
     duplicateThreshold: z.ZodNumber;
     enableDuplicateDetection: z.ZodBoolean;
     enablePrReview: z.ZodBoolean;
@@ -14,21 +18,29 @@ export declare const ConfigSchema: z.ZodObject<{
     llmApiKey: string;
     llmProvider: "openai" | "anthropic";
     llmModel: string;
+    runBacklog: boolean;
     duplicateThreshold: number;
     enableDuplicateDetection: boolean;
     enablePrReview: boolean;
     enableLabeling: boolean;
     databaseUrl?: string | undefined;
+    backlogLimit?: number | undefined;
+    backlogReportIssue?: number | undefined;
+    visionDocument?: string | undefined;
 }, {
     githubToken: string;
     llmApiKey: string;
     llmProvider: "openai" | "anthropic";
     llmModel: string;
+    runBacklog: boolean;
     duplicateThreshold: number;
     enableDuplicateDetection: boolean;
     enablePrReview: boolean;
     enableLabeling: boolean;
     databaseUrl?: string | undefined;
+    backlogLimit?: number | undefined;
+    backlogReportIssue?: number | undefined;
+    visionDocument?: string | undefined;
 }>;
 export type Config = z.infer<typeof ConfigSchema>;
 export declare const DuplicateResultSchema: z.ZodObject<{
@@ -133,6 +145,23 @@ export declare const LabelSuggestionSchema: z.ZodObject<{
     labels: string[];
 }>;
 export type LabelSuggestion = z.infer<typeof LabelSuggestionSchema>;
+export declare const VisionAlignmentSchema: z.ZodObject<{
+    fit: z.ZodEnum<["aligned", "off-track", "neutral"]>;
+    score: z.ZodNumber;
+    concerns: z.ZodArray<z.ZodString, "many">;
+    recommendation: z.ZodString;
+}, "strip", z.ZodTypeAny, {
+    fit: "aligned" | "off-track" | "neutral";
+    score: number;
+    concerns: string[];
+    recommendation: string;
+}, {
+    fit: "aligned" | "off-track" | "neutral";
+    score: number;
+    concerns: string[];
+    recommendation: string;
+}>;
+export type VisionAlignment = z.infer<typeof VisionAlignmentSchema>;
 export interface IssueEvent {
     action: string;
     issue: {
