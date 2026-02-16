@@ -113,7 +113,9 @@ Respond with a JSON object:
   "reasoning": "Detailed explanation of your decision"
 }
 
-Only include items you consider duplicates in similarItems. If not a duplicate, return empty array.`;
+If items are clearly duplicates, include those items in similarItems.
+If items are not duplicates but are semantically related, still include the strongest related items in similarItems.
+If there is no meaningful overlap, return empty array.`;
 
     const responseFactory = async () => {
       const response = await this.client.chat.completions.create({

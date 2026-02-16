@@ -275,6 +275,133 @@ describe('TriageService label triggers', () => {
   });
 });
 
+describe('TriageService issue dedupe clarity', () => {
+  it('posts related comments on both issues when semantic overlap is detected', async () => {
+    const storage = makeStorage();
+    const config: Config = {
+      ...baseConfig,
+      enableDuplicateDetection: true,
+      enableLabeling: false,
+      enablePrReview: false,
+    };
+
+    storage.findSimilar.mockResolvedValueOnce([
+      {
+        number: 100,
+        title: 'Existing login submit issue',
+        url: 'https://github.com/example-org/example-repo/issues/100',
+        similarity: 0.8,
+        type: 'issue',
+      },
+    ]);
+
+    jest.spyOn(LLMService.prototype, 'generateEmbedding').mockResolvedValue([0.1, 0.2, 0.3]);
+    jest.spyOn(LLMService.prototype, 'detectDuplicate').mockResolvedValue({
+      isDuplicate: false,
+      similarItems: [
+        {
+          number: 100,
+          title: 'Existing login submit issue',
+          url: 'https://github.com/example-org/example-repo/issues/100',
+          similarity: 0.8,
+        },
+      ],
+      reasoning: 'Related login submit behavior, but not a hard duplicate.',
+    });
+
+    jest.spyOn(GitHubService.prototype, 'getIssue').mockResolvedValue({
+      number: 100,
+      title: 'Existing login submit issue',
+      body: 'Existing issue body',
+      html_url: 'https://github.com/example-org/example-repo/issues/100',
+    } as any);
+
+    jest.spyOn(GitHubService.prototype, 'getIssueComments').mockResolvedValue([]);
+    const postIssueCommentSpy = jest.spyOn(GitHubService.prototype, 'postIssueComment').mockResolvedValue();
+
+    const triage = new TriageService(config, storage);
+    await triage.processIssue(issueEventFixture as any);
+
+    expect(postIssueCommentSpy).toHaveBeenCalledWith(
+      'example-org',
+      'example-repo',
+      issueEventFixture.issue.number,
+      expect.stringContaining('Potentially Related Issue Detected')
+    );
+    expect(postIssueCommentSpy).toHaveBeenCalledWith(
+      'example-org',
+      'example-repo',
+      100,
+      expect.stringContaining('Linked by PRism')
+    );
+  });
+
+  it('applies duplicate label on both source and referenced issue when available', async () => {
+    const storage = makeStorage();
+    const config: Config = {
+      ...baseConfig,
+      enableDuplicateDetection: true,
+      enableLabeling: true,
+      enablePrReview: false,
+    };
+
+    storage.findSimilar.mockResolvedValueOnce([
+      {
+        number: 100,
+        title: 'Existing duplicate issue',
+        url: 'https://github.com/example-org/example-repo/issues/100',
+        similarity: 0.92,
+        type: 'issue',
+      },
+    ]);
+
+    jest.spyOn(LLMService.prototype, 'generateEmbedding').mockResolvedValue([0.1, 0.2, 0.3]);
+    jest.spyOn(LLMService.prototype, 'detectDuplicate').mockResolvedValue({
+      isDuplicate: true,
+      similarItems: [
+        {
+          number: 100,
+          title: 'Existing duplicate issue',
+          url: 'https://github.com/example-org/example-repo/issues/100',
+          similarity: 0.92,
+        },
+      ],
+      reasoning: 'Same issue details and root cause.',
+    });
+    jest.spyOn(LLMService.prototype, 'suggestLabels').mockResolvedValue({
+      labels: [],
+      reasoning: 'No extra labels',
+    });
+
+    jest.spyOn(GitHubService.prototype, 'getIssue').mockResolvedValue({
+      number: 100,
+      title: 'Existing duplicate issue',
+      body: 'Existing issue body',
+      html_url: 'https://github.com/example-org/example-repo/issues/100',
+    } as any);
+    jest.spyOn(GitHubService.prototype, 'getIssueComments').mockResolvedValue([]);
+    jest.spyOn(GitHubService.prototype, 'getRepositoryLabels').mockResolvedValue(['duplicate', 'bug']);
+    const addLabelsSpy = jest.spyOn(GitHubService.prototype, 'addLabels').mockResolvedValue();
+    jest.spyOn(GitHubService.prototype, 'postIssueComment').mockResolvedValue();
+
+    const triage = new TriageService(config, storage);
+    await triage.processIssue(issueEventFixture as any);
+
+    expect(addLabelsSpy).toHaveBeenCalledWith(
+      'example-org',
+      'example-repo',
+      issueEventFixture.issue.number,
+      ['duplicate']
+    );
+    expect(addLabelsSpy).toHaveBeenCalledWith(
+      'example-org',
+      'example-repo',
+      100,
+      ['duplicate']
+    );
+  });
+});
+
 describe('TriageService SHA caching behavior', () => {
   it('stores PR embeddings with the PR head SHA key', async () => {
     const storage = makeStorage();

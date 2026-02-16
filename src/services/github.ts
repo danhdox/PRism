@@ -90,6 +90,21 @@ export class GitHubService {
   }
 
   /**
+   * Get all comments for an issue
+   */
+  async getIssueComments(owner: string, repo: string, issueNumber: number): Promise<any[]> {
+    return await this.octokit.paginate(
+      this.octokit.rest.issues.listComments,
+      {
+        owner,
+        repo,
+        issue_number: issueNumber,
+        per_page: 100,
+      }
+    );
+  }
+
+  /**
    * Post a comment on a PR
    */
   async postPullRequestComment(

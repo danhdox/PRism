@@ -193,11 +193,22 @@ export class TriageService {
       );
 
       const result = await this.llm.detectDuplicate(issue.title, issue.body || '', similarIssuesWithBody);
+      const classification = this.classifyDedupeResult(result);
 
-      if (result.isDuplicate && result.similarItems.length > 0) {
+      if (classification.status === 'duplicate') {
         const comment = this.formatDuplicateComment(result, 'issue');
-        await this.github.postIssueComment(owner, repo, issue.number, comment);
+        const signalTag = `prism-issue-signal:duplicate:${result.similarItems[0]?.number ?? 'none'}`;
+        await this.postIssueSignalCommentIfNew(owner, repo, issue.number, comment, signalTag);
+        await this.postIssueCrossReference(owner, repo, issue, result, classification.status);
+        await this.applyIssueDedupeLabels(owner, repo, [issue.number, result.similarItems[0]?.number ?? 0], classification.status);
         core.info(`Posted duplicate detection comment for issue #${issue.number}`);
+      } else if (classification.status === 'related') {
+        const comment = this.formatRelatedComment(result, 'issue');
+        const signalTag = `prism-issue-signal:related:${result.similarItems[0]?.number ?? 'none'}`;
+        await this.postIssueSignalCommentIfNew(owner, repo, issue.number, comment, signalTag);
+        await this.postIssueCrossReference(owner, repo, issue, result, classification.status);
+        await this.applyIssueDedupeLabels(owner, repo, [issue.number, result.similarItems[0]?.number ?? 0], classification.status);
+        core.info(`Posted related-item comment for issue #${issue.number}`);
       } else {
         core.info('Issue is not a duplicate');
       }
@@ -241,11 +252,16 @@ export class TriageService {
       );
 
       const result = await this.llm.detectDuplicate(pr.title, pr.body || '', similarPrsWithBody);
+      const classification = this.classifyDedupeResult(result);
 
-      if (result.isDuplicate && result.similarItems.length > 0) {
+      if (classification.status === 'duplicate') {
         const comment = this.formatDuplicateComment(result, 'pr');
         await this.github.postPullRequestComment(owner, repo, pr.number, comment);
         core.info(`Posted duplicate detection comment for PR #${pr.number}`);
+      } else if (classification.status === 'related') {
+        const comment = this.formatRelatedComment(result, 'pr');
+        await this.github.postPullRequestComment(owner, repo, pr.number, comment);
+        core.info(`Posted related-item comment for PR #${pr.number}`);
       } else {
         core.info('PR is not a duplicate');
       }
@@ -458,6 +474,89 @@ export class TriageService {
     return severityCounts;
   }
 
+  private classifyDedupeResult(result: {
+    isDuplicate: boolean;
+    similarItems: Array<{ similarity: number }>;
+  }): { status: DedupeStatus; similarity: number } {
+    const similarity = result.similarItems[0]?.similarity ?? 0;
+    const relatedThreshold = Math.max(0, this.config.duplicateThreshold - 0.1);
+
+    if (result.isDuplicate && similarity >= this.config.duplicateThreshold) {
+      return { status: 'duplicate', similarity };
+    }
+    if (similarity >= relatedThreshold) {
+      return { status: 'related', similarity };
+    }
+
+    return { status: 'distinct', similarity };
+  }
+
+  private async postIssueSignalCommentIfNew(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    comment: string,
+    markerTag: string
+  ): Promise<void> {
+    const marker = `<!-- ${markerTag} -->`;
+    const comments = await this.github.getIssueComments(owner, repo, issueNumber);
+    const exists = comments.some((entry: { body?: string }) => entry.body?.includes(marker));
+
+    if (exists) {
+      core.info(`Skipping existing issue signal comment (${markerTag}) on #${issueNumber}`);
+      return;
+    }
+
+    await this.github.postIssueComment(owner, repo, issueNumber, `${comment}\n\n${marker}`);
+  }
+
+  private async postIssueCrossReference(
+    owner: string,
+    repo: string,
+    issue: IssueEvent['issue'],
+    result: {
+      similarItems: Array<{ number: number; title: string; url: string; similarity: number }>;
+      reasoning: string;
+    },
+    status: 'duplicate' | 'related'
+  ): Promise<void> {
+    const reference = result.similarItems[0];
+    if (!reference || reference.number === issue.number) {
+      return;
+    }
+
+    const markerTag = `prism-issue-crosslink:${issue.number}:${status}`;
+    const comment = this.formatCrossLinkedIssueComment(issue, reference, status, result.reasoning);
+    await this.postIssueSignalCommentIfNew(owner, repo, reference.number, comment, markerTag);
+  }
+
+  private async applyIssueDedupeLabels(
+    owner: string,
+    repo: string,
+    issueNumbers: number[],
+    status: 'duplicate' | 'related'
+  ): Promise<void> {
+    if (!this.config.enableLabeling) {
+      return;
+    }
+
+    const repoLabels = await this.github.getRepositoryLabels(owner, repo);
+    const preferredLabels = status === 'duplicate'
+      ? ['duplicate', 'possible-duplicate', 'triage:duplicate', 'dedupe']
+      : ['related', 'possible-related', 'triage:related'];
+    const selectedLabel = preferredLabels.find((label) => repoLabels.includes(label));
+
+    if (!selectedLabel) {
+      core.info(`No repository label available for ${status} signals.`);
+      return;
+    }
+
+    const uniqueIssueNumbers = [...new Set(issueNumbers)].filter((number) => number > 0);
+    await Promise.all(
+      uniqueIssueNumbers.map((number) => this.github.addLabels(owner, repo, number, [selectedLabel]))
+    );
+  }
+
   private async resolveDuplicateStatus(
     owner: string,
     repo: string,
@@ -485,17 +584,7 @@ export class TriageService {
     );
 
     const result = await this.llm.detectDuplicate(title, body, similarWithBody);
-    const similarity = result.similarItems[0]?.similarity ?? 0;
-    const relatedThreshold = Math.max(0, this.config.duplicateThreshold - 0.1);
-
-    if (result.isDuplicate && similarity >= this.config.duplicateThreshold) {
-      return { status: 'duplicate', similarity };
-    }
-    if (similarity >= relatedThreshold) {
-      return { status: 'related', similarity };
-    }
-
-    return { status: 'distinct', similarity };
+    return this.classifyDedupeResult(result);
   }
 
   private scoreBacklogEntry(input: ScoringInputs): BacklogScore {
@@ -622,6 +711,43 @@ export class TriageService {
     comment += `\n**Analysis:**\n${result.reasoning}\n\n`;
     comment += `---\n`;
     comment += `*This analysis was generated by [PRism](https://github.com/danhdox/prism) AI triage.*`;
+
+    return comment;
+  }
+
+  private formatRelatedComment(result: any, type: 'issue' | 'pr'): string {
+    const emoji = type === 'issue' ? '🔗' : '🔁';
+    const typeLabel = type === 'issue' ? 'Issue' : 'PR';
+    let comment = `${emoji} **Potentially Related ${typeLabel} Detected**\n\n`;
+    comment += `This ${type} appears to be related to:\n\n`;
+
+    for (const item of result.similarItems) {
+      const percentage = (item.similarity * 100).toFixed(1);
+      comment += `- [#${item.number}](${item.url}) - ${item.title} (${percentage}% similar)\n`;
+    }
+
+    comment += `\n**Analysis:**\n${result.reasoning}\n\n`;
+    comment += `---\n`;
+    comment += `*This analysis was generated by [PRism](https://github.com/danhdox/prism) AI triage.*`;
+
+    return comment;
+  }
+
+  private formatCrossLinkedIssueComment(
+    sourceIssue: IssueEvent['issue'],
+    matchedIssue: { number: number; title: string; url: string; similarity: number },
+    status: 'duplicate' | 'related',
+    reasoning: string
+  ): string {
+    const statusLabel = status === 'duplicate' ? 'potential duplicate' : 'related issue';
+    const similarity = (matchedIssue.similarity * 100).toFixed(1);
+    let comment = `🔁 **Linked by PRism**\n\n`;
+    comment += `Issue [#${sourceIssue.number}](${sourceIssue.html_url}) was flagged as a ${statusLabel} of this issue (${similarity}% similar).\n\n`;
+    comment += `- Source issue: [#${sourceIssue.number}](${sourceIssue.html_url}) - ${sourceIssue.title}\n`;
+    comment += `- Match context: [#${matchedIssue.number}](${matchedIssue.url}) - ${matchedIssue.title}\n\n`;
+    comment += `**Analysis:**\n${reasoning}\n\n`;
+    comment += `---\n`;
+    comment += `*This cross-link was generated by [PRism](https://github.com/danhdox/prism) AI triage.*`;
 
     return comment;
   }
