@@ -37,6 +37,30 @@ jobs:
           llm-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
 
+## Roadmap
+
+### Done (MVP)
+
+- [x] Duplicate and related issue/PR detection with confidence signals
+- [x] Structured PR review comments with findings + complexity estimate
+- [x] Automatic label suggestions and application
+- [x] Vision alignment analysis for PRs
+- [x] Off-track handling modes: `comment`, `label`, `fail`
+- [x] Stateful mode support with Postgres + pgvector
+
+### Next
+
+- [ ] Backlog triage mode for scheduled scans and prioritized queues
+- [ ] Better explainability in comments (why this PR/issue was matched)
+- [ ] Configurable confidence thresholds per repository workflow
+- [ ] One-click "needs human review" escalation path
+
+### Later
+
+- [ ] Cross-repo similarity detection for org-wide triage
+- [ ] Improved signal blending (semantic similarity + file/risk heuristics)
+- [ ] Triage analytics dashboard and trend reporting
+
 ## Documentation
 
 - 📖 [Full Documentation](./USAGE.md)
