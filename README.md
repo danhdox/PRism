@@ -2,6 +2,12 @@
 
 AI-powered GitHub Action for smarter open-source triage. PRism detects duplicate issues and PRs, generates structured PR review summaries, applies intelligent labels, and optionally supports Postgres + pgvector for persistent similarity.
 
+## Why This Exists
+
+[![Post that inspired PRism](./tweet.png)](https://x.com/steipete/status/2023057089346580828)
+
+PRism started as a response to high-volume OSS triage pain raised by [@steipete](https://github.com/steipete): duplicate issues, duplicate PRs, and too much manual review overhead.
+
 ## Features
 
 - 🔍 **Duplicate Detection**: AI-powered duplicate detection for issues and PRs
